@@ -1,0 +1,14 @@
+services:
+  bitacora:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      DATA_FILE: /app/data/reports.json
+    volumes:
+      - bitacora-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  bitacora-data:
