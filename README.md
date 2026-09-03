@@ -1,189 +1,347 @@
-# Bitácora Cero Señal
+# Demo de Aplicaciones Web Offline-First
 
-Demo para exponer el tema **Aplicaciones web Offline-First**. Es una bitácora de reportes que permite crear y editar registros sin conexión, los conserva en el navegador y los sincroniza con una API cuando vuelve la señal.
+Aplicación de reportes que sigue funcionando sin internet, guarda los datos localmente y los sincroniza con una API cuando recupera la conexión.
 
-La aplicación está pensada para que la demostración sea segura durante una exposición: incluye un botón **Simular corte**, estados visibles de **Pendiente**, **Sincronizado** y **Conflicto**, además de sincronización manual como respaldo.
+**Referencias oficiales:** [operación offline en una PWA](https://developer.mozilla.org/en-US/docs/Web/Progressive_web_apps/Guides/Offline_and_background_operation), [caché para PWA](https://developer.mozilla.org/en-US/docs/Web/Progressive_web_apps/Guides/Caching), [IndexedDB](https://developer.mozilla.org/en-US/docs/Web/API/IndexedDB_API), [Background Sync](https://developer.mozilla.org/en-US/docs/Web/API/Background_Synchronization_API) y [Express](https://expressjs.com/en/starter/installing/).
 
-## Qué se demuestra
+## ¿Qué es Offline-First y por qué usarlo?
 
-- **PWA:** manifiesto instalable y Service Worker.
-- **Caché:** el Service Worker guarda la interfaz y permite volver a abrirla sin red.
-- **IndexedDB:** conserva reportes y una cola de operaciones en el dispositivo.
-- **Sincronización:** envía la cola a una API Express al recuperar conexión.
-- **Consistencia:** cada registro tiene una versión; si dos dispositivos modifican la misma versión, la interfaz pide elegir qué copia conservar.
-- **Respaldo manual:** el botón **Sincronizar ahora** evita depender únicamente de Background Sync, cuyo soporte no es uniforme.
+Offline-First es un enfoque en el que la aplicación considera la pérdida de conexión como un estado normal, no como un error excepcional. La acción principal se completa primero en el dispositivo y la comunicación con el servidor ocurre después.
 
-## Arquitectura
+En esta demo, cuando el usuario crea o edita un reporte:
 
-```text
-Usuario
-  │
-  ▼
-React + TypeScript
-  │  guarda primero
-  ▼
-IndexedDB ─────► Cola de salida (outbox)
-  ▲                         │
-  │                         │ vuelve la conexión
-  │                         ▼
-Service Worker       POST /api/reports/sync
-  │                         │
-  └── caché PWA             ▼
-                    Express + versionado
-                             │
-                             ▼
-                      data/reports.json
-```
+1. React actualiza la interfaz.
+2. IndexedDB guarda el reporte.
+3. Una cola local registra la operación pendiente.
+4. Cuando hay conexión, la cola se envía a Express.
+5. La API acepta el cambio o devuelve un conflicto de versiones.
 
-El frontend nunca espera a la API para aceptar el trabajo del usuario. Primero escribe localmente y después intenta sincronizar. Ese orden es la idea central de **Offline-First**.
+Ventajas principales:
 
-## Tecnologías
+- **Continuidad:** el usuario puede seguir trabajando con una conexión inestable.
+- **Respuesta inmediata:** guardar no depende del tiempo de respuesta de la red.
+- **Persistencia:** cerrar o recargar la pestaña no elimina los cambios pendientes.
+- **Sincronización controlada:** los estados pendiente, sincronizado y conflicto son visibles.
 
-- React 19, Vite y TypeScript.
-- IndexedDB sin abstracciones, para que el código educativo muestre la API del navegador.
-- Service Worker escrito a mano con caché de la interfaz y Background Sync progresivo.
-- Node.js, Express 5 y TypeScript.
-- Docker y Docker Compose.
-- Persistencia de demostración en JSON, montada en un volumen de Docker.
+Comparado con una aplicación web tradicional, esta solución no bloquea el formulario cuando la API deja de responder. El servidor sigue siendo importante, pero deja de ser un requisito para cada interacción.
 
-## Ejecutar en desarrollo
+## 1) Requisitos
 
-Requisitos: Node.js 20 o superior y npm.
+- Node.js 20 o superior.
+- npm.
+- Un navegador moderno; Chrome o Edge permiten mostrar más fácilmente las herramientas de PWA.
+- Docker Desktop, únicamente si se ejecutará la versión en contenedor.
+
+## 2) Instalar el proyecto
+
+Desde la carpeta raíz:
 
 ```bash
 npm install
+```
+
+El proyecto utiliza *workspaces* de npm para instalar el frontend y la API con un solo comando.
+
+## 3) Estructura del proyecto
+
+```text
+/
+├── client/
+│   ├── public/
+│   │   ├── icon.svg
+│   │   ├── manifest.webmanifest
+│   │   └── sw.js
+│   ├── src/
+│   │   ├── App.tsx
+│   │   ├── db.ts
+│   │   ├── main.tsx
+│   │   ├── styles.css
+│   │   ├── sync.ts
+│   │   └── types.ts
+│   ├── index.html
+│   └── vite.config.ts
+├── server/
+│   └── src/
+│       ├── app.ts
+│       ├── index.ts
+│       ├── repository.ts
+│       └── types.ts
+├── Dockerfile
+├── docker-compose.yml
+├── GUIA_EXPOSICION.md
+└── package.json
+```
+
+## 4) Arquitectura general
+
+```text
+┌───────────────────────────────────────────────────────┐
+│ Navegador                                             │
+│                                                       │
+│  React ──► IndexedDB ──► outbox                       │
+│    ▲                         │                        │
+│    │                         │ sincronización         │
+│    └──── Service Worker ◄────┘                        │
+│              │ caché                                  │
+└──────────────┼────────────────────────────────────────┘
+               │ HTTP
+               ▼
+┌───────────────────────────────────────────────────────┐
+│ API Express                                           │
+│ Validación ──► control de versión ──► reports.json    │
+└───────────────────────────────────────────────────────┘
+```
+
+El **Service Worker** conserva los archivos necesarios para abrir la interfaz. **IndexedDB** almacena los datos de negocio. Separar ambas responsabilidades evita usar el caché HTTP como si fuera una base de datos.
+
+## 5) Código principal
+
+### 5.1 Modelo local y estados de sincronización
+
+Cada reporte local conoce la versión del servidor que fue editada y su estado actual:
+
+```ts
+// client/src/types.ts
+export type SyncStatus = "pending" | "synced" | "conflict";
+
+export interface LocalReport {
+  id: string;
+  title: string;
+  description: string;
+  priority: "low" | "medium" | "high";
+  createdAt: string;
+  updatedAt: string;
+  serverVersion: number | null;
+  syncStatus: SyncStatus;
+  conflict?: ServerReport;
+}
+```
+
+- `pending`: el reporte está seguro en el dispositivo, pero todavía no está confirmado por la API.
+- `synced`: la copia local coincide con la versión conocida del servidor.
+- `conflict`: el servidor cambió desde la última versión descargada.
+
+### 5.2 Persistencia con IndexedDB
+
+La base local tiene dos almacenes:
+
+```ts
+// client/src/db.ts
+const REPORTS = "reports";
+const OUTBOX = "outbox";
+
+request.onupgradeneeded = () => {
+  const db = request.result;
+  db.createObjectStore(REPORTS, { keyPath: "id" });
+
+  const store = db.createObjectStore(OUTBOX, {
+    keyPath: "operationId",
+  });
+  store.createIndex("reportId", "reportId");
+};
+```
+
+`reports` contiene el estado visible de la aplicación. `outbox` implementa el patrón **Transactional Outbox**: representa los cambios que deben viajar al servidor.
+
+Al guardar, ambos almacenes se modifican dentro de una transacción. Si el usuario edita varias veces el mismo reporte antes de sincronizar, la cola conserva únicamente la operación más reciente.
+
+### 5.3 Sincronización con la API
+
+El frontend toma las operaciones pendientes y las envía en un lote:
+
+```ts
+// client/src/sync.ts
+const response = await fetch("/api/reports/sync", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ operations }),
+});
+```
+
+Después procesa cada resultado:
+
+- `accepted`: elimina la operación de la cola y marca el reporte como sincronizado.
+- `conflict`: elimina la operación enviada, conserva la copia local y adjunta la versión actual del servidor para que el usuario decida.
+
+Finalmente descarga los reportes del servidor. Los datos recibidos nunca sobrescriben un cambio local pendiente.
+
+### 5.4 Service Worker y estrategias de caché
+
+El Service Worker se registra al cargar React:
+
+```ts
+// client/src/main.tsx
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/sw.js");
+  });
+}
+```
+
+Se aplican estrategias distintas según el recurso:
+
+| Recurso | Estrategia | Comportamiento |
+| --- | --- | --- |
+| Navegación HTML | Network First | Busca la versión reciente y usa el shell guardado si la red falla. |
+| JavaScript, CSS e íconos | Stale While Revalidate | Responde desde caché y actualiza la copia en segundo plano. |
+| `/api/*` | Sin caché HTTP | Los registros se coordinan explícitamente mediante IndexedDB. |
+
+La API de Background Sync se usa como mejora progresiva:
+
+```js
+// client/public/sw.js
+self.addEventListener("sync", (event) => {
+  if (event.tag === "sync-bitacora") {
+    event.waitUntil(syncOutbox());
+  }
+});
+```
+
+Como Background Sync no está disponible de forma uniforme en todos los navegadores, la aplicación también escucha el evento `online` e incluye el botón **Sincronizar ahora**.
+
+### 5.5 API con Express y TypeScript
+
+Express expone tres rutas:
+
+```text
+GET  /api/health          Estado de la API
+GET  /api/reports         Reportes almacenados en el servidor
+POST /api/reports/sync    Sincronización de operaciones locales
+```
+
+La ruta de sincronización valida el lote y delega el control de versiones al repositorio:
+
+```ts
+// server/src/app.ts
+app.post("/api/reports/sync", async (request, response) => {
+  const operations = request.body?.operations;
+  const results = await repository.synchronize(operations);
+  response.json({ results });
+});
+```
+
+La implementación real incluye validación de tipos, límites de longitud y un máximo de 100 operaciones por solicitud.
+
+### 5.6 Idempotencia y conflictos
+
+Cada cambio usa dos datos importantes:
+
+- `operationId`: identificador único de la operación. Si se reintenta la misma petición, la API devuelve el resultado anterior y no duplica el registro.
+- `baseVersion`: versión que el cliente conocía cuando editó. Si no coincide con la versión actual del servidor, la API devuelve `conflict`.
+
+```ts
+// server/src/repository.ts
+if (existing && operation.report.baseVersion !== existing.version) {
+  result = {
+    operationId: operation.operationId,
+    status: "conflict",
+    report: existing,
+  };
+}
+```
+
+En la interfaz, el usuario puede escoger **Usar servidor** o **Conservar la mía**. La segunda opción vuelve a encolar la copia local tomando como base la versión más reciente.
+
+## 6) Ejecutar el proyecto
+
+```bash
 npm run dev
 ```
 
-Abrir `http://localhost:5173`. Vite sirve el frontend y redirige `/api` hacia Express en `http://localhost:3000`.
+Servicios de desarrollo:
 
-Comandos disponibles:
+- Aplicación: `http://localhost:5173`
+- API: `http://localhost:3000`
+
+Vite redirige automáticamente las solicitudes `/api` hacia Express, por lo que el frontend usa rutas relativas tanto en desarrollo como en producción.
+
+## 7) Probar el funcionamiento Offline-First
+
+### Demostración rápida
+
+1. Abrir la aplicación.
+2. Pulsar **Simular corte**.
+3. Crear un reporte.
+4. Comprobar que aparece como **Pendiente**.
+5. Pulsar **Restaurar señal**.
+6. Esperar la sincronización automática o pulsar **Sincronizar ahora**.
+7. Comprobar que el estado cambia a **Sincronizado**.
+
+### Prueba real del caché
+
+1. Cargar la aplicación una vez con conexión.
+2. Abrir las herramientas del navegador.
+3. En la pestaña **Network**, seleccionar **Offline**.
+4. Recargar la página.
+5. La interfaz debe seguir disponible gracias al Service Worker.
+
+El botón **Simular corte** pausa las llamadas de sincronización para facilitar la exposición. No desactiva físicamente la red ni sustituye la prueba real del Service Worker.
+
+## 8) Construir para producción
 
 ```bash
-npm run dev      # frontend y API en modo desarrollo
-npm run check    # comprobación de TypeScript
-npm run build    # compilación de producción
-npm start        # sirve la app compilada desde Express
+npm run check
+npm run build
+npm start
 ```
 
-Después de `npm run build`, `npm start` publica frontend y API juntos en `http://localhost:3000`.
+La aplicación completa queda disponible en `http://localhost:3000`. Express sirve la compilación de React y la API desde el mismo origen.
 
-## Ejecutar con Docker
+## 9) Ejecutar con Docker
 
 ```bash
 docker compose up --build
 ```
 
-Abrir `http://localhost:3000`. Los datos del servidor quedan en el volumen `bitacora-data` y sobreviven al reinicio del contenedor.
+Abrir `http://localhost:3000`.
 
-Para detener la aplicación:
+El volumen `bitacora-data` conserva `reports.json` aunque el contenedor se reinicie.
+
+Para detenerlo sin borrar los datos:
 
 ```bash
 docker compose down
 ```
 
-No agregues `-v` si quieres conservar los datos de la demo.
+## 10) Conceptos clave usados
 
-## Guion de exposición para cuatro integrantes
+- **PWA:** aplicación web instalable con manifiesto y Service Worker.
+- **App Shell:** estructura visual mínima guardada para poder abrir la interfaz sin red.
+- **Cache Storage:** almacenamiento de respuestas HTTP controlado por el Service Worker.
+- **IndexedDB:** base de datos transaccional del navegador para información estructurada.
+- **Outbox:** cola persistente de operaciones aún no confirmadas por el servidor.
+- **Optimistic UI:** la interfaz acepta el cambio local antes de recibir respuesta de la API.
+- **Sincronización progresiva:** Background Sync cuando existe, evento `online` y acción manual como alternativas.
+- **Control optimista de concurrencia:** comparación de versiones antes de sobrescribir datos.
+- **Idempotencia:** repetir una operación no genera registros duplicados.
 
-Duración sugerida: **10 a 12 minutos**.
+## 11) ¿Por qué esta aplicación es resistente?
 
-### Integrante 1 — Problema y enfoque (2 minutos)
+- Los datos del formulario se guardan antes de intentar usar la red.
+- El caché de la PWA y la base IndexedDB cumplen funciones separadas.
+- La cola sobrevive a recargas y cierres del navegador.
+- Las peticiones pueden reintentarse sin duplicar reportes.
+- Los cambios remotos no sobrescriben silenciosamente los locales.
+- La sincronización manual evita depender de una API experimental.
+- Docker monta la persistencia del servidor en un volumen.
 
-1. Plantear el caso: técnicos en campo, estudiantes o personal de salud pueden trabajar con señal intermitente.
-2. Aclarar la diferencia: una app tradicional intenta guardar en el servidor y falla; una app Offline-First guarda primero en el dispositivo.
-3. Presentar el flujo de la pantalla y señalar el estado **En línea**.
-4. Frase clave: *“Offline-First no significa sin servidor; significa que perder la conexión no interrumpe la tarea principal.”*
+## 12) Comparativa rápida
 
-### Integrante 2 — PWA, Service Worker y caché (2 a 3 minutos)
+| Enfoque | Sin conexión | Persistencia local | Manejo de conflictos | Complejidad |
+| --- | --- | --- | --- | --- |
+| SPA tradicional | La interfaz puede fallar o quedar bloqueada | Opcional | Normalmente no | Baja |
+| `localStorage` solamente | Limitado | Sí, pero sin transacciones ni consultas avanzadas | No incluido | Baja |
+| PWA solo con caché | Abre la interfaz | El caché no es una base de datos de negocio | No incluido | Media |
+| Esta demo Offline-First | Interfaz y creación de reportes | IndexedDB transaccional | Versionado y decisión del usuario | Media |
+| Solución empresarial distribuida | Sí | Base local especializada | Reglas por dominio, auditoría y fusiones | Alta |
 
-1. Explicar que el manifiesto permite instalar la app y que el Service Worker se ubica entre la página y la red.
-2. Contar la estrategia usada:
-   - Navegación: **Network First**, con la versión en caché como respaldo.
-   - Recursos estáticos: **Stale While Revalidate**, muestra el caché y actualiza en segundo plano.
-   - API: no se cachea; los datos se gestionan con IndexedDB para evitar mezclar interfaz y registros.
-3. Si se desea una prueba real, cargar la página una vez, activar **Offline** en las herramientas del navegador y recargar. La interfaz debe seguir abriendo.
-4. Advertir que una caché antigua es un riesgo; el nombre `bitacora-shell-v1` permite invalidarla cambiando la versión.
 
-### Integrante 3 — IndexedDB y demo sin conexión (3 minutos)
+## 13) Comandos disponibles
 
-1. Pulsar **Simular corte**. El indicador cambia a **Sin conexión**.
-2. Crear un reporte, por ejemplo:
-   - Título: `Antena sin cobertura en bloque C`
-   - Detalle: `El dispositivo registra la medición aunque la red no responde.`
-   - Prioridad: `Alta`
-3. Mostrar que aparece inmediatamente como **Pendiente** y aumenta el contador **Por sincronizar**.
-4. Explicar que se hicieron dos escrituras atómicas en IndexedDB:
-   - El reporte local.
-   - Una operación en la cola `outbox`.
-5. Frase clave: *“La pantalla no está fingiendo: el dato ya está persistido en el navegador.”*
+```bash
+npm run dev      # inicia React y Express
+npm run check    # comprueba los tipos de ambos proyectos
+npm run build    # genera la compilación de producción
+npm start        # sirve frontend y API en el puerto 3000
+```
 
-### Integrante 4 — Sincronización, límites y cierre (3 minutos)
-
-1. Pulsar **Restaurar señal**. La app sincroniza automáticamente.
-2. Si no ocurre de inmediato, usar **Sincronizar ahora**. El reporte cambia de **Pendiente** a **Sincronizado**.
-3. Explicar que la API guarda un número de versión y recuerda el identificador de cada operación. Esto evita duplicados si se reintenta una petición.
-4. Presentar el límite: dos dispositivos pueden editar la misma versión. El segundo en sincronizar recibe un **Conflicto** y puede escoger **Usar servidor** o **Conservar la mía**.
-5. Cerrar con ventajas y límites:
-   - Ventajas: continuidad, respuesta inmediata y menor dependencia de la red.
-   - Límites: datos temporalmente desactualizados, conflictos y soporte desigual de Background Sync.
-   - Prevención aplicada: estados visibles, versionado, sincronización manual y pruebas del caché.
-
-## Demo de conflicto opcional
-
-Para provocar un conflicto real se necesitan dos almacenes locales independientes, porque dos pestañas normales comparten IndexedDB:
-
-1. Abrir la aplicación en una ventana normal y en una ventana privada.
-2. Sincronizar ambas para que tengan el reporte inicial con versión 1.
-3. Activar **Simular corte** en las dos.
-4. Editar el mismo reporte de manera diferente en cada ventana.
-5. Restaurar la señal en la primera ventana; su cambio se convierte en versión 2.
-6. Restaurar la señal en la segunda; verá el estado **Conflicto**.
-7. Elegir **Usar servidor** o **Conservar la mía** y explicar la decisión.
-
-## Estrategias de caché incluidas
-
-| Recurso | Estrategia | Motivo |
-| --- | --- | --- |
-| Navegación HTML | Network First | Intenta obtener la versión reciente y usa el shell guardado si falla. |
-| JS, CSS, ícono y manifiesto | Stale While Revalidate | Entrega rápido lo conocido y refresca el caché. |
-| `/api/*` | Sin caché del Service Worker | Los registros usan IndexedDB y reglas explícitas de sincronización. |
-
-## Protocolo de sincronización
-
-El cliente envía operaciones a `POST /api/reports/sync`. Cada operación contiene:
-
-- `operationId`: clave idempotente para que un reintento no duplique datos.
-- `reportId`: identificador estable del reporte.
-- `baseVersion`: versión del servidor que el cliente editó, o `null` para un registro nuevo.
-- El contenido y las fechas del reporte.
-
-La API responde `accepted` con la nueva versión o `conflict` con la copia actual del servidor. Antes de enviar, la cola compacta ediciones repetidas del mismo registro para mandar solo la última.
-
-## Riesgos y prevención aplicada
-
-| Riesgo | Prevención en la demo |
-| --- | --- |
-| Cargar una versión antigua | Caché con nombre versionado y actualización en segundo plano. |
-| Background Sync no disponible | Detección de conexión y botón de sincronización manual. |
-| Duplicar un registro por reintento | `operationId` idempotente almacenado por la API. |
-| Sobrescribir cambios de otro dispositivo | Control optimista con `baseVersion` y resolución explícita. |
-| Cerrar la pestaña con cambios pendientes | Cola y reportes persistidos en IndexedDB. |
-| Reiniciar el contenedor | Volumen de Docker para el archivo del servidor. |
-
-## Dónde mirar en el código
-
-- `client/src/db.ts`: base IndexedDB y cola de salida.
-- `client/src/sync.ts`: envío y descarga de datos.
-- `client/public/sw.js`: caché PWA y Background Sync.
-- `client/src/App.tsx`: estados visuales y flujo de la demo.
-- `server/src/repository.ts`: persistencia, idempotencia y control de versiones.
-- `server/src/app.ts`: endpoints y validación de la API.
-
-## Antes de exponer
-
-1. Ejecutar la demo una vez con internet para instalar el Service Worker y llenar el caché.
-2. Confirmar que **Simular corte → crear → Restaurar señal** funciona.
-3. Si se mostrará la recarga sin red, ensayarla en el mismo navegador y origen que se usará en clase.
-4. Evitar limpiar los datos del sitio antes de presentar.
-5. Tener Docker ya construido y `npm install` completado para no depender de descargas durante la exposición.
